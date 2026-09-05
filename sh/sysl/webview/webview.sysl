@@ -1,0 +1,379 @@
+module sh.sysl.webview
+
+import sh.sysl.webview.c
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, from_cstring}
+
+// A native window with the platform's own browser engine in it, bound to
+// [webview](https://github.com/webview/webview).
+//
+// There is no bundled engine and no Chromium: WKWebView on macOS, WebKitGTK on Linux, WebView2 on
+// Windows. A whole application is a window, some HTML, and a handful of functions the page can
+// call.
+//
+//     val w = webview()?
+//
+//     w.title("Hello")?
+//     w.size(640, 480)?
+//     w.html("<h1>Hello from sysl</h1>")?
+//     w.run()?
+//
+// ==Two things decide the shape of everything below==
+//
+// **`run` blocks, and it must be called on the thread the webview was created on.** It returns when
+// the window closes or when `terminate` is called. Everything a program wants to do to the window
+// afterwards happens either before `run`, or from inside a `bind` callback, or through `dispatch`.
+//
+// **A `bind` callback is how the page talks to sysl.** `bind("name", f)` puts an asynchronous
+// `window.name(...)` on the page; calling it runs `f` with the arguments as a JSON string, and
+// whatever `f` answers resolves or rejects the page's promise. That is the whole bridge — there is
+// no other channel — and `eval` is how sysl talks back the other way.
+//
+// ==What is deliberately not here==
+//
+// **Nothing parses or builds JSON.** A `bind` callback is handed the raw argument array as text and
+// answers raw JSON text, because a binding that took a position on which JSON library to use would
+// be making that choice for every consumer. `sh.sysl.json` is one import away and is what to reach
+// for.
+//
+// **`get_native_handle` answers a bare pointer** and is in the `c` module rather than here. What to
+// do with an `NSWindow` is not something this package can help with, and typing it would be a claim
+// about a platform.
+
+// Why a call did not do what it was asked.
+//
+// **webview's codes are mostly negative**, which is worth knowing before writing a check: `OK` is 0,
+// the failures run -1 down to -5, and `Duplicate` and `NotFound` are the positive 1 and 2. So
+// success is not "not negative".
+enum Error
+    // webview would not say more than that it failed.
+    Unspecified
+
+    // One of the arguments was not usable — most often a null where a string was wanted.
+    InvalidArgument
+
+    // The webview is not in a state where this makes sense: `terminate` before `run`, or anything at
+    // all after `destroy`.
+    InvalidState
+
+    // The operation was cancelled.
+    Canceled
+
+    // **The platform's web engine is not installed.** On Windows that is the WebView2 runtime, and
+    // on Linux the WebKitGTK the library was built against. It is the one failure here that a user
+    // rather than a programmer has to fix.
+    MissingDependency
+
+    // A binding of that name already exists.
+    Duplicate
+
+    // No binding of that name exists.
+    NotFound
+
+    // A code this version of the binding does not know. webview's set is small and closed, so this
+    // arm means the library is newer than the binding.
+    Other(code: int)
+
+    // The number webview spells this as.
+    code(self) -> int = self match
+        Unspecified        -> c.UNSPECIFIED
+        InvalidArgument    -> c.INVALID_ARGUMENT
+        InvalidState       -> c.INVALID_STATE
+        Canceled           -> c.CANCELED
+        MissingDependency  -> c.MISSING_DEPENDENCY
+        Duplicate          -> c.DUPLICATE
+        NotFound           -> c.NOT_FOUND
+        Other(code)        -> code
+
+    // What went wrong, as a sentence. webview has no `strerror` of its own, so these are this
+    // binding's words.
+    message(self) -> string = self match
+        Unspecified       -> "webview failed and did not say why"
+        InvalidArgument   -> "one of the arguments was not usable"
+        InvalidState      -> "the webview is not in a state where that makes sense"
+        Canceled          -> "the operation was cancelled"
+        MissingDependency -> "the platform's web engine is not installed"
+        Duplicate         -> "a binding of that name already exists"
+        NotFound          -> "no binding of that name exists"
+        Other(code)       -> f"webview answered ${code}%d, which this binding does not know"
+end Error
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+
+// Which `Error` a return code is.
+private[webview] failure(code: int) -> Error = code match
+    c.UNSPECIFIED        -> Unspecified
+    c.INVALID_ARGUMENT   -> InvalidArgument
+    c.INVALID_STATE      -> InvalidState
+    c.CANCELED           -> Canceled
+    c.MISSING_DEPENDENCY -> MissingDependency
+    c.DUPLICATE          -> Duplicate
+    c.NOT_FOUND          -> NotFound
+    _                    -> Other(code)
+
+private checked(code: int) -> Result[unit, Error] =
+    if code == c.OK then Ok(()) else Err(failure(code))
+
+// How `size` is to read the width and height it is given.
+enum Hint
+    // A starting size the user may change.
+    Start
+
+    // A floor: the window may not be made smaller.
+    Minimum
+
+    // A ceiling: the window may not be made larger.
+    Maximum
+
+    // Exactly this, and the user cannot resize at all.
+    Fixed
+
+    code(self) -> int = self match
+        Start   -> c.HINT_NONE
+        Minimum -> c.HINT_MIN
+        Maximum -> c.HINT_MAX
+        Fixed   -> c.HINT_FIXED
+end Hint
+
+// What a page's call to a bound function is answered with.
+//
+// `Ok` resolves the page's promise and `Err` rejects it, and **both carry raw JSON** — this package
+// takes no position on which JSON library builds it. A string result has to be a JSON string, quotes
+// and all: `"\"hello\""` rather than `"hello"`.
+type Answer = Result[string, string]
+
+// One registration of a page-callable function: the webview to answer through, and the closure to
+// run.
+//
+// **It is boxed and kept alive by the handle**, because what crosses to C is its *address* in the
+// `void *` webview hands back to the trampoline, and a raw pointer keeps nothing alive by itself.
+// This is the shape `~/dev/sysl-lang/CLAUDE.md` prescribes for a callback-driven library with a
+// user-data slot.
+//
+// The webview is held as a raw `*c.Webview` rather than as a `&WebviewHandle` on purpose: a strong
+// reference here would be a cycle — the handle owns this — and a cycle is the one thing counting
+// cannot collect. It is safe because a `Bound` cannot outlive the handle that owns it.
+private struct Bound
+    private w: *c.Webview
+    private f: &Fn(string) -> Answer
+end Bound
+
+// The trampoline every binding goes through, and there is only one of it.
+//
+// **A closure has no address C can call**, so a registration cannot hand webview the sysl function
+// itself. What it hands over is this ordinary top-level function plus the `Bound`'s address in the
+// user-data slot, which is enough to find the closure again. One trampoline serves every
+// registration, because it is the same code every time.
+//
+// It needs no `@export`: every parameter is a pointer, so `&on_bound` is an address C can call. That
+// is only true because nothing here crosses by value — a callback taking an aggregate by value would
+// need `@export`, and then could not be a closure at all.
+private[webview] on_bound(id: *u8, req: *u8, arg: *u8)
+    val bound: *Bound = ptr_cast(arg)
+
+    // webview always passes both, so a failure to read one is a corrupt call rather than an absent
+    // argument, and answering the page with a rejection is better than faulting inside its callback.
+    val request = from_cstring(req).unwrap_or("[]")
+
+    val answer = (*bound).f(request)
+
+    val (status, text) = answer match
+        Ok(value)  -> (0, value)
+        Err(why)   -> (1, why)
+
+    val out = cstring(text)
+    val call = cstring(from_cstring(id).unwrap_or(""))
+
+    c.ret((*bound).w, call.ptr, status, out.ptr)
+
+// One deferred piece of work, boxed for the same reason a `Bound` is.
+private struct Work
+    private f: &Fn() -> unit
+end Work
+
+// The trampoline `dispatch` goes through. The webview it is handed is ignored: a closure that wants
+// the window captured it.
+private[webview] on_dispatch(w: *c.Webview, arg: *u8)
+    val work: *Work = ptr_cast(arg)
+
+    (*work).f()
+
+// The webview's C pointer, and everything boxed that C holds a bare address of.
+//
+// ==Why this is a separate type from `Webview`==
+//
+// A method receives `self` by value, so it cannot put *the box it was called through* into anything
+// it builds — and constructing a fresh value around the same pointer hands out a second owner, which
+// for a type with a destructor means two calls to `webview_destroy`. Splitting the ownership out is
+// what makes `Webview` copyable and cheap while there is only ever one owner of the C handle.
+//
+// `sysl-lang/lmdb` has the same split for the same reason, and the language question it raises is
+// filed as card 0416.
+private struct WebviewHandle
+    private w: *c.Webview
+
+    // Every boxed closure C holds the address of. **Nothing is ever removed**, and that is the
+    // decision this field represents: a `Bound` has to live as long as the page can call it, which
+    // is as long as the webview, and `unbind` cannot know whether a call is in flight. A `Work` is
+    // kept on the same list for want of a way to take it off safely — see `dispatch`.
+    private live: Buf[usize]
+
+    private raw(self) -> *c.Webview = self.w
+
+    private keep_bound(*self, b: &Bound) -> *u8
+        val p: *u8 = ptr_cast(&*b)
+
+        self.live.push(usize(p))
+
+        p
+
+    private keep_work(*self, k: &Work) -> *u8
+        val p: *u8 = ptr_cast(&*k)
+
+        self.live.push(usize(p))
+
+        p
+end WebviewHandle
+
+impl Drop for WebviewHandle
+    drop(self)
+        c.destroy(self.w)
+    end drop
+
+// A window with a browser engine in it.
+//
+// Copying one is free and copies no window — it is a reference to the same webview.
+struct Webview
+    private h: &WebviewHandle
+
+    // The window's title.
+    title(self, text: string) -> Result[unit, Error]
+        val s = cstring(text)
+
+        checked(c.set_title(self.h.raw(), s.ptr))
+
+    // The window's size, and how it is to be read.
+    size(self, width: int, height: int, hint: Hint = Hint.Start) -> Result[unit, Error] =
+        checked(c.set_size(self.h.raw(), width, height, hint.code()))
+
+    // Loads a URL. `http:`, `https:`, `file:` and `data:` all work.
+    navigate(self, url: string) -> Result[unit, Error]
+        val s = cstring(url)
+
+        checked(c.navigate(self.h.raw(), s.ptr))
+
+    // Loads a page from a string, which is how a program with no server serves itself.
+    html(self, markup: string) -> Result[unit, Error]
+        val s = cstring(markup)
+
+        checked(c.set_html(self.h.raw(), s.ptr))
+
+    // Runs `js` **before every page's own scripts, on every navigation**, which is where a `bind`
+    // has to be announced to the page if the page is to find it early.
+    //
+    // Called before `run` and never after: webview applies it at navigation time.
+    on_load(self, js: string) -> Result[unit, Error]
+        val s = cstring(js)
+
+        checked(c.init(self.h.raw(), s.ptr))
+
+    // Runs `js` in the current page, now.
+    //
+    // **It answers nothing.** JavaScript is evaluated on the page's own thread and this returns as
+    // soon as the work is queued — a value comes back the other way, by the script calling something
+    // that was `bind`ed.
+    eval(self, js: string) -> Result[unit, Error]
+        val s = cstring(js)
+
+        checked(c.eval(self.h.raw(), s.ptr))
+
+    // Makes `name` an asynchronous function on the page's `window`.
+    //
+    // The closure is handed the call's arguments as a JSON array — `"[1,\"two\"]"` — and answers
+    // JSON that resolves or rejects the page's promise:
+    //
+    //     w.bind("add", (args) ->
+    //         // parse args with sh.sysl.json, add, and answer
+    //         Ok("3"))?
+    //
+    // **The closure is kept for the life of the webview.** It has to be: the page may call it at any
+    // moment until the window closes, and nothing on this side can know when the last call has been
+    // made. `unbind` stops the page seeing the name and deliberately does not release the closure.
+    bind(self, name: string, f: &Fn(string) -> Answer) -> Result[unit, Error]
+        val b: &Bound = Bound(self.h.raw(), f)
+        val arg = self.h.keep_bound(b)
+        val n = cstring(name)
+
+        checked(c.bind(self.h.raw(), n.ptr, &on_bound, arg))
+
+    // Takes `name` off the page's `window`. The closure that was registered is not released — see
+    // `bind`.
+    unbind(self, name: string) -> Result[unit, Error]
+        val n = cstring(name)
+
+        checked(c.unbind(self.h.raw(), n.ptr))
+
+    // Runs `f` on the webview's own thread, once, the next time the loop turns.
+    //
+    // **This is the only thing here that is safe to call from another thread**, and it is how a
+    // worker reaches `eval` or `title` — every other method on this type has to be called from the
+    // thread that made the webview.
+    //
+    // **The closure is kept for the life of the webview**, as a `bind`'s is, and unlike a `bind`'s
+    // that is a genuine cost rather than a necessity: a program that dispatches once per frame grows
+    // its retained set forever. Dispatch occasionally — to hand a finished result back to the window
+    // — and let the page drive anything that happens every frame.
+    dispatch(self, f: &Fn() -> unit) -> Result[unit, Error]
+        val k: &Work = Work(f)
+        val arg = self.h.keep_work(k)
+
+        checked(c.dispatch(self.h.raw(), &on_dispatch, arg))
+
+    // **Runs the window, and does not return until it closes** or `terminate` is called. It must be
+    // called on the thread that made the webview.
+    run(self) -> Result[unit, Error] = checked(c.run(self.h.raw()))
+
+    // Stops `run`. Safe to call from a `bind` callback, which is the usual way an application closes
+    // itself.
+    terminate(self) -> Result[unit, Error] = checked(c.terminate(self.h.raw()))
+
+    // The platform's own window object — an `NSWindow` on macOS, a `GtkWindow` on Linux, an `HWND`
+    // on Windows. A bare address, because what to do with one is not something this package can
+    // help with.
+    native_window(self) -> *u8 = c.get_window(self.h.raw())
+end Webview
+
+// Opens a webview.
+//
+// `debug` asks the platform's engine for its developer tools where it has any, which is WKWebView's
+// inspector on macOS. It is ignored where the engine has none.
+//
+// **Nothing is shown until `run`.** Set the title, the size and the content first; a `bind` has to be
+// registered before `run` too, since `run` does not return until the window has closed.
+//
+//     val w = webview()?
+//
+//     w.title("Notes")?
+//     w.size(800, 600, Hint.Minimum)?
+//     w.bind("save", (args) -> Ok("null"))?
+//     w.html(page)?
+//     w.run()?
+webview(debug: bool = false) -> Result[Webview, Error]
+    val w = c.create(if debug then 1 else 0, ptr_cast(0usize))
+
+    // **A null here is almost always the engine missing**, not a programming mistake: WebView2 not
+    // installed on Windows, or no WebKitGTK on Linux. webview reports it by answering nothing at
+    // all, so this is the binding's own reading of the situation rather than a code it was given.
+    if usize(w) == 0 then return Err(MissingDependency)
+
+    Ok(Webview(WebviewHandle(w, buf())))
+
+// The version of webview this program is linked against, as major, minor and patch.
+//
+// **This is the one call that needs no window**, which makes it the whole of what a test can check
+// on a machine with no window server. See the README.
+version() -> (u32, u32, u32)
+    val p = c.version()
+
+    ((*p).version.major, (*p).version.minor, (*p).version.patch)

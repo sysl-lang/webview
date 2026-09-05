@@ -1,0 +1,153 @@
+module sh.sysl.webview.c
+@link("webview")
+@include("<stddef.h>")
+@include("<webview/api.h>")
+
+// webview as C declares it, and nothing else.
+//
+// This is the whole of the boundary: the library the program links, the header the numbers are
+// measured from, the one handle whose shape webview never publishes, the version struct it does, its
+// error codes and hints, and one `extern` per entry point. `sh.sysl.webview` is what an application
+// imports.
+//
+// ==The header is `webview/api.h`, and getting that wrong is the first thing that happens==
+//
+// The obvious `<webview/webview.h>` is **not** the C header. It is two `#include`s — `api.h`, which
+// is the C API under an `extern "C"`, and `c_api_impl.hh`, which is C++ and is included
+// unconditionally. A `c const` block is a C translation unit, so reading `webview.h` fails with a
+// wall of errors naming a C++ header rather than naming the mistake.
+//
+// ==There is no shim, and webview is a clean case for that==
+//
+// `15 §7` names three shapes only C can reach — a caller-allocated opaque type, a macro, and a shape
+// with no sysl spelling. webview has none:
+//
+// - **The handle is allocated by the library.** `webview_create` answers a `webview_t`, which is a
+//   `void *`, so nothing is placed in storage this side owns.
+// - **Every error code and hint is an `enum` enumerator**, which a `c const` block reads as happily
+//   as a `#define` — qrcodegen established that.
+// - **Both callbacks take nothing but pointers and an `int`.** So `&f` on an ordinary sysl function
+//   is a pointer C can call, and none of the `@export` the aggregate-by-value rule would force is
+//   needed. Checked rather than assumed.
+//
+// The one struct that crosses is `webview_version_info_t`, and it crosses **by address** —
+// `webview_version` answers a pointer to a static one. It is laid out below and its size and three
+// offsets are asserted against the C in `tests.sysl`.
+//
+// ==And the library is C++, which costs this package nothing and is worth knowing==
+//
+// webview is a C++14 header-only library with a C API layered on it. sysl compiles `.c` and nothing
+// else, so it could never be *vendored* here — but a prebuilt shared library is just a shared
+// library, and the one the tap's formula builds records WebKit, libc++ and libobjc as its own load
+// commands. So the link line is one `-lwebview` with no frameworks on it, which matters because a
+// sysl `@link` directive names a library and cannot be a `-framework` flag.
+
+// The webview instance. C's `webview_t` is a `void *` — an opaque handle by convention rather than
+// an incomplete type — and it is written bodyless here, which says the same thing more strongly:
+// only `*Webview` may be spoken, and it cannot be crossed with any other pointer.
+opaque struct Webview
+
+// The three numbers in a version.
+struct Version
+    major: u32
+    minor: u32
+    patch: u32
+end Version
+
+// What `webview_version` answers a pointer to. The three character arrays are fixed-size and are
+// laid out here rather than reached through an accessor, because webview publishes no accessor —
+// the struct *is* the interface.
+struct VersionInfo
+    version: Version
+    version_number: [32]u8
+    pre_release: [48]u8
+    build_metadata: [48]u8
+end VersionInfo
+
+// ## The numbers, asked for rather than written down
+
+// The size and offsets `VersionInfo` above depends on, so that an upstream change to the struct
+// fails a test rather than reading the wrong bytes forever.
+c const
+    INFO_SIZE: usize   = "sizeof(webview_version_info_t)"
+    OFF_NUMBER: usize  = "offsetof(webview_version_info_t, version_number)"
+    OFF_PRE: usize     = "offsetof(webview_version_info_t, pre_release)"
+    OFF_BUILD: usize   = "offsetof(webview_version_info_t, build_metadata)"
+
+// What every call but `create`, `get_window` and `version` answers.
+//
+// **They are mostly negative**, which is unusual enough to be worth naming: `OK` is 0, the failures
+// run from -1 down to -5, and the two "this already exists / does not exist" answers are the
+// positive 1 and 2. So a caller cannot test for success with `>= 0`.
+c const
+    OK: int                 = "WEBVIEW_ERROR_OK"
+    UNSPECIFIED: int        = "WEBVIEW_ERROR_UNSPECIFIED"
+    INVALID_ARGUMENT: int   = "WEBVIEW_ERROR_INVALID_ARGUMENT"
+    INVALID_STATE: int      = "WEBVIEW_ERROR_INVALID_STATE"
+    CANCELED: int           = "WEBVIEW_ERROR_CANCELED"
+    MISSING_DEPENDENCY: int = "WEBVIEW_ERROR_MISSING_DEPENDENCY"
+    DUPLICATE: int          = "WEBVIEW_ERROR_DUPLICATE"
+    NOT_FOUND: int          = "WEBVIEW_ERROR_NOT_FOUND"
+
+// How `set_size` is to read the width and height it is given.
+c const
+    HINT_NONE: int  = "WEBVIEW_HINT_NONE"
+    HINT_MIN: int   = "WEBVIEW_HINT_MIN"
+    HINT_MAX: int   = "WEBVIEW_HINT_MAX"
+    HINT_FIXED: int = "WEBVIEW_HINT_FIXED"
+
+// Which native object `get_native_handle` is being asked for.
+c const
+    HANDLE_UI_WINDOW: int         = "WEBVIEW_NATIVE_HANDLE_KIND_UI_WINDOW"
+    HANDLE_UI_WIDGET: int         = "WEBVIEW_NATIVE_HANDLE_KIND_UI_WIDGET"
+    HANDLE_BROWSER_CONTROLLER: int = "WEBVIEW_NATIVE_HANDLE_KIND_BROWSER_CONTROLLER"
+
+// ## The seventeen entry points
+//
+// Every one of them, which is the whole of webview's C API — `nm -gU` on the shared library answers
+// exactly these seventeen symbols and nothing else.
+
+// `window` is null for a window webview makes itself, or a native window handle to embed in.
+extern "webview_create" create(debug: int, window: *u8) -> *Webview
+
+extern "webview_destroy" destroy(w: *Webview) -> int
+
+// **Blocks until the window closes or `terminate` is called**, and must be called on the thread the
+// webview was created on.
+extern "webview_run" run(w: *Webview) -> int
+
+extern "webview_terminate" terminate(w: *Webview) -> int
+
+// Runs `fn` on the webview's own thread, once, the next time the loop turns. This is the only entry
+// point here that is safe to call from another thread.
+extern "webview_dispatch" dispatch(w: *Webview, fn: *extern (*Webview, *u8) -> unit,
+                                   arg: *u8) -> int
+
+extern "webview_get_window" get_window(w: *Webview) -> *u8
+extern "webview_get_native_handle" get_native_handle(w: *Webview, kind: int) -> *u8
+
+extern "webview_set_title" set_title(w: *Webview, title: *u8) -> int
+extern "webview_set_size" set_size(w: *Webview, width: int, height: int, hints: int) -> int
+
+extern "webview_navigate" navigate(w: *Webview, url: *u8) -> int
+extern "webview_set_html" set_html(w: *Webview, html: *u8) -> int
+
+// Runs `js` before every page's own scripts, on every navigation. This is where a binding installed
+// with `bind` has to be announced to the page.
+extern "webview_init" init(w: *Webview, js: *u8) -> int
+
+// Runs `js` in the current page, now. Answers nothing — a result comes back through a `bind`.
+extern "webview_eval" eval(w: *Webview, js: *u8) -> int
+
+// Makes `name` a function on the page's `window`. The callback is handed the call's id, the
+// arguments as a JSON array, and whatever `arg` was.
+extern "webview_bind" bind(w: *Webview, name: *u8,
+                           fn: *extern (*u8, *u8, *u8) -> unit, arg: *u8) -> int
+
+extern "webview_unbind" unbind(w: *Webview, name: *u8) -> int
+
+// Answers a call that `bind` delivered. `status` of 0 resolves the page's promise and anything else
+// rejects it; `result` is JSON either way.
+extern "webview_return" ret(w: *Webview, id: *u8, status: int, result: *u8) -> int
+
+extern "webview_version" version() -> *VersionInfo

@@ -1,0 +1,36 @@
+package {
+  name    = "webview"
+  version = "0.1.0"
+
+  // `Webview` is a `Drop` type whose constructor answers `&T`, which 0.0.91's `DropReturnCheck` is
+  // what keeps honest.
+  sysl = "0.0.91"
+}
+
+// **`posix`, because a webview is a window.** It talks to a window server, spawns the platform's
+// browser engine, and runs an event loop; there is no freestanding target this works on, and saying
+// so turns "this cannot work there" into one refusal rather than a link error naming
+// `webview_create`.
+//
+// **`heap`, because the binding allocates.** A `CString` for every call that takes text, and a boxed
+// closure for every `bind` — all of it sysl storage with a lifetime, which is what keeps this side
+// from ever having to free what webview handed back.
+requires {
+  heap  = true
+  posix = true
+
+  // **webview ships no pkg-config file of its own, and no releases either.** This one comes from
+  // `sysl-lang/homebrew-tap`, whose formula pins the upstream commit this binding was written
+  // against, builds the shared library with CMake, gives it an absolute install name, and writes the
+  // `.pc` upstream lacks:
+  //
+  //     brew install sysl-lang/tap/webview
+  //
+  // The absolute install name is not a detail. webview's CMake gives the library a SOVERSION and so
+  // an `@rpath` install name, and `--link-path` emits `-L` and no `-rpath` — so a program built
+  // against a stock build links cleanly and then dies at startup with *"no LC_RPATH's found"*, which
+  // reads as a missing library sitting exactly where it was said to be.
+  pkg_config {
+    webview = "webview — `brew install sysl-lang/tap/webview`; upstream has no releases and no .pc, so the tap's formula is what provides both"
+  }
+}

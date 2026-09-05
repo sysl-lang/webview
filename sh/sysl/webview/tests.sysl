@@ -1,0 +1,71 @@
+module sh.sysl.webview
+@tests
+
+import sh.sysl.webview.c
+
+@test("the version struct sysl lays out is the one C has")
+layout()
+    assert_eq(sizeof(c.VersionInfo), c.INFO_SIZE, "the whole struct")
+    assert_eq(offsetof(c.VersionInfo, version_number), c.OFF_NUMBER, "version_number")
+    assert_eq(offsetof(c.VersionInfo, pre_release), c.OFF_PRE, "pre_release")
+    assert_eq(offsetof(c.VersionInfo, build_metadata), c.OFF_BUILD, "build_metadata")
+
+@test("the library links and says which version it is")
+version_reads()
+    val (major, minor, patch) = version()
+
+    assert_eq(int(major), 0, "major")
+    assert_eq(int(minor), 12, "minor")
+
+// **Success is not "not negative", and this is the test that says so.** webview's codes run from -5
+// to 2 with 0 in the middle, so `>= 0` is true for `Duplicate` and `NotFound` as well as for
+// success, and a caller who wrote that check would treat "no binding of that name exists" as having
+// worked.
+@test("webview's codes straddle zero, so a sign test is not a success test")
+codes_straddle_zero()
+    assert_eq(c.OK, 0, "OK")
+    assert_eq(c.UNSPECIFIED, -1, "UNSPECIFIED")
+    assert_eq(c.INVALID_ARGUMENT, -2, "INVALID_ARGUMENT")
+    assert_eq(c.INVALID_STATE, -3, "INVALID_STATE")
+    assert_eq(c.CANCELED, -4, "CANCELED")
+    assert_eq(c.MISSING_DEPENDENCY, -5, "MISSING_DEPENDENCY")
+    assert_eq(c.DUPLICATE, 1, "DUPLICATE is positive")
+    assert_eq(c.NOT_FOUND, 2, "and so is NOT_FOUND")
+
+    assert(c.DUPLICATE >= 0, "which is why a >= 0 check would call a duplicate a success")
+
+@test("every code maps to an error and back to itself")
+error_round_trip()
+    val codes = [c.UNSPECIFIED, c.INVALID_ARGUMENT, c.INVALID_STATE, c.CANCELED,
+                 c.MISSING_DEPENDENCY, c.DUPLICATE, c.NOT_FOUND]
+
+    for i in 0..<codes.len
+        assert_eq(failure(codes[i]).code(), codes[i], f"code ${codes[i]}%d survives the round trip")
+        assert(failure(codes[i]).message().len > 0, f"and ${codes[i]}%d has a sentence")
+
+// A code the binding does not know is carried rather than flattened, so a newer webview does not
+// silently report the wrong thing.
+@test("an unknown code is carried rather than guessed at")
+unknown_code()
+    failure(99) match
+        Other(code) -> assert_eq(code, 99, "carried as itself")
+        other       -> assert(false, f"99 is not one of webview's codes: ${other}%s")
+
+@test("the size hints are the header's, and Start is the one that means no constraint")
+hints()
+    assert_eq(Hint.Start.code(), c.HINT_NONE, "Start")
+    assert_eq(Hint.Minimum.code(), c.HINT_MIN, "Minimum")
+    assert_eq(Hint.Maximum.code(), c.HINT_MAX, "Maximum")
+    assert_eq(Hint.Fixed.code(), c.HINT_FIXED, "Fixed")
+
+    assert_eq(c.HINT_NONE, 0, "NONE is zero, so a forgotten hint is the permissive one")
+
+// The two callbacks are taken by address and handed to C. Nothing here calls them — that needs a
+// window — but a trampoline that could not have its address taken would fail to compile, and this
+// is what pins that it can. It is the fact that decides whether a `bind` can be a closure at all:
+// every parameter is a pointer, so no `@export` is needed.
+@test("both trampolines have addresses C can call")
+trampolines_are_addressable()
+    assert(usize(&on_bound) != 0, "the bind trampoline")
+    assert(usize(&on_dispatch) != 0, "the dispatch trampoline")
+    assert(usize(&on_bound) != usize(&on_dispatch), "and they are two different functions")
