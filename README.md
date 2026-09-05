@@ -48,7 +48,7 @@ brew install sysl-lang/tap/webview
 
 ```hocon
 dependencies {
-  webview { git = "github.com/sysl-lang/webview", version = "0.1.0" }
+  webview { git = "github.com/sysl-lang/webview", version = "0.2.0" }
 }
 ```
 
@@ -140,11 +140,23 @@ from sysl at all.
 
 ## Ownership
 
-`Webview` is two types — a private handle that owns the C pointer and has the destructor, and a plain
-copyable value holding a `&` to it. That is forced rather than tidy: a method receives `self` by
-value, so it cannot put the box it was called through into anything it builds, and constructing a
-fresh value around the same pointer would hand out a second owner and so a second `webview_destroy`.
-`sysl-lang/lmdb` has the same split, arrived at the same way; the language question is card 0416.
+`Webview` is **one type**, owning the C pointer and carrying the destructor.
+
+**Until v0.2.0 it was two** — a private handle with the destructor plus a copyable value holding a
+`&` to it — and this section said the split was forced, because a method receives `self` by value
+and so cannot put the box it was called through into anything it builds. The premise is true and the
+conclusion was wrong: **`&self` hands a method the box itself**, and had done all along. Nobody
+tried it, and the workaround worked, so nothing ever failed to say otherwise. `sysl-lang/lmdb` made
+the same mistake independently, each binding reading the other.
+
+The hazard the split was avoiding is real: constructing a fresh value around the same pointer hands
+out a second owner and so a second `webview_destroy`. What removes it is `&self` rather than a
+second type.
+
+Nothing here actually needs `&self` today, because a `Webview` hands nothing that outlives a call
+back to a caller — the closures it keeps are stored on itself. `sysl-lang/lmdb`, whose transactions
+*are* handed out, is where the receiver does real work; `reference/declarations.md § A '&self'
+method may keep what it was called on` is where the form is written down.
 
 ## Testing — and this is the honest part
 
@@ -177,8 +189,10 @@ SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .
 Covers **the sysl half only** — webview arrives through `pkg_config`, so its objects are somebody
 else's build and no flag of ours instruments them.
 
-> A green ASan run over an unchanged tree proves nothing: `sysl test` caches its artifact and the key
-> does not include `SYSL_EXTRA_CFLAGS`. Check `nm -u <binary> | grep -c asan`. Card 0415.
+> **Before sysl 0.0.104** a green ASan run over an unchanged tree proved nothing: `sysl test` cached
+> its artifact and the key did not include `SYSL_EXTRA_CFLAGS`, so the uninstrumented binary was
+> replayed. Fixed in 0.0.104 — a sanitizer run rebuilds now. `nm -u <binary> | grep -c asan` is still
+> worth running, and answers the question it was always best at: *is this binary instrumented*.
 
 ## Not bound yet
 

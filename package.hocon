@@ -1,6 +1,6 @@
 package {
   name    = "webview"
-  version = "0.1.0"
+  version = "0.2.0"
 
   // `Webview` is a `Drop` type whose constructor answers `&T`, which 0.0.91's `DropReturnCheck` is
   // what keeps honest.

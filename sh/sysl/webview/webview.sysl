@@ -151,9 +151,9 @@ type Answer = Result[string, string]
 // This is the shape `~/dev/sysl-lang/CLAUDE.md` prescribes for a callback-driven library with a
 // user-data slot.
 //
-// The webview is held as a raw `*c.Webview` rather than as a `&WebviewHandle` on purpose: a strong
-// reference here would be a cycle — the handle owns this — and a cycle is the one thing counting
-// cannot collect. It is safe because a `Bound` cannot outlive the handle that owns it.
+// The webview is held as a raw `*c.Webview` rather than as a `&Webview` on purpose: a strong
+// reference here would be a cycle — the webview owns this — and a cycle is the one thing counting
+// cannot collect. It is safe because a `Bound` cannot outlive the webview that owns it.
 private struct Bound
     private w: *c.Webview
     private f: &Fn(string) -> Answer
@@ -199,18 +199,26 @@ private[webview] on_dispatch(w: *c.Webview, arg: *u8)
 
     (*work).f()
 
-// The webview's C pointer, and everything boxed that C holds a bare address of.
+// A window with a browser engine in it, its C pointer, and everything boxed that C holds a bare
+// address of.
 //
-// ==Why this is a separate type from `Webview`==
+// ==Until v0.2.0 this was TWO types, and it never needed to be==
 //
-// A method receives `self` by value, so it cannot put *the box it was called through* into anything
-// it builds — and constructing a fresh value around the same pointer hands out a second owner, which
-// for a type with a destructor means two calls to `webview_destroy`. Splitting the ownership out is
-// what makes `Webview` copyable and cheap while there is only ever one owner of the C handle.
+// A `WebviewHandle` owned the C pointer and carried the destructor, and a copyable `Webview` held a
+// `&` to it. The reason given was that a method receives `self` by value and so cannot put *the box
+// it was called through* into anything it builds — true — and that the split was therefore forced,
+// which was not. **`&self` hands a method the box itself**, so a value it constructs takes a share
+// rather than a second owner. It had been in the language the whole time; nobody tried it, and the
+// workaround worked, so nothing ever failed to say otherwise.
 //
-// `sysl-lang/lmdb` has the same split for the same reason, and the language question it raises is
-// filed as card 0416.
-private struct WebviewHandle
+// Nothing here needs `&self` today, because a `Webview` hands nothing that outlives a call back to a
+// caller — the closures it keeps are stored on itself. What the collapse buys is one type instead of
+// two and a paragraph that no longer teaches a contortion. `sysl-lang/lmdb`, whose transactions
+// *are* handed out, is where the receiver does real work.
+//
+// `reference/declarations.md § A '&self' method may keep what it was called on` is where the form is
+// written down.
+struct Webview
     private w: *c.Webview
 
     // Every boxed closure C holds the address of. **Nothing is ever removed**, and that is the
@@ -234,40 +242,28 @@ private struct WebviewHandle
         self.live.push(usize(p))
 
         p
-end WebviewHandle
-
-impl Drop for WebviewHandle
-    drop(self)
-        c.destroy(self.w)
-    end drop
-
-// A window with a browser engine in it.
-//
-// Copying one is free and copies no window — it is a reference to the same webview.
-struct Webview
-    private h: &WebviewHandle
 
     // The window's title.
     title(self, text: string) -> Result[unit, Error]
         val s = cstring(text)
 
-        checked(c.set_title(self.h.raw(), s.ptr))
+        checked(c.set_title(self.raw(), s.ptr))
 
     // The window's size, and how it is to be read.
     size(self, width: int, height: int, hint: Hint = Hint.Start) -> Result[unit, Error] =
-        checked(c.set_size(self.h.raw(), width, height, hint.code()))
+        checked(c.set_size(self.raw(), width, height, hint.code()))
 
     // Loads a URL. `http:`, `https:`, `file:` and `data:` all work.
     navigate(self, url: string) -> Result[unit, Error]
         val s = cstring(url)
 
-        checked(c.navigate(self.h.raw(), s.ptr))
+        checked(c.navigate(self.raw(), s.ptr))
 
     // Loads a page from a string, which is how a program with no server serves itself.
     html(self, markup: string) -> Result[unit, Error]
         val s = cstring(markup)
 
-        checked(c.set_html(self.h.raw(), s.ptr))
+        checked(c.set_html(self.raw(), s.ptr))
 
     // Runs `js` **before every page's own scripts, on every navigation**, which is where a `bind`
     // has to be announced to the page if the page is to find it early.
@@ -276,7 +272,7 @@ struct Webview
     on_load(self, js: string) -> Result[unit, Error]
         val s = cstring(js)
 
-        checked(c.init(self.h.raw(), s.ptr))
+        checked(c.init(self.raw(), s.ptr))
 
     // Runs `js` in the current page, now.
     //
@@ -286,7 +282,7 @@ struct Webview
     eval(self, js: string) -> Result[unit, Error]
         val s = cstring(js)
 
-        checked(c.eval(self.h.raw(), s.ptr))
+        checked(c.eval(self.raw(), s.ptr))
 
     // Makes `name` an asynchronous function on the page's `window`.
     //
@@ -301,18 +297,18 @@ struct Webview
     // moment until the window closes, and nothing on this side can know when the last call has been
     // made. `unbind` stops the page seeing the name and deliberately does not release the closure.
     bind(self, name: string, f: &Fn(string) -> Answer) -> Result[unit, Error]
-        val b: &Bound = Bound(self.h.raw(), f)
-        val arg = self.h.keep_bound(b)
+        val b: &Bound = Bound(self.raw(), f)
+        val arg = self.keep_bound(b)
         val n = cstring(name)
 
-        checked(c.bind(self.h.raw(), n.ptr, &on_bound, arg))
+        checked(c.bind(self.raw(), n.ptr, &on_bound, arg))
 
     // Takes `name` off the page's `window`. The closure that was registered is not released — see
     // `bind`.
     unbind(self, name: string) -> Result[unit, Error]
         val n = cstring(name)
 
-        checked(c.unbind(self.h.raw(), n.ptr))
+        checked(c.unbind(self.raw(), n.ptr))
 
     // Runs `f` on the webview's own thread, once, the next time the loop turns.
     //
@@ -326,23 +322,28 @@ struct Webview
     // — and let the page drive anything that happens every frame.
     dispatch(self, f: &Fn() -> unit) -> Result[unit, Error]
         val k: &Work = Work(f)
-        val arg = self.h.keep_work(k)
+        val arg = self.keep_work(k)
 
-        checked(c.dispatch(self.h.raw(), &on_dispatch, arg))
+        checked(c.dispatch(self.raw(), &on_dispatch, arg))
 
     // **Runs the window, and does not return until it closes** or `terminate` is called. It must be
     // called on the thread that made the webview.
-    run(self) -> Result[unit, Error] = checked(c.run(self.h.raw()))
+    run(self) -> Result[unit, Error] = checked(c.run(self.raw()))
 
     // Stops `run`. Safe to call from a `bind` callback, which is the usual way an application closes
     // itself.
-    terminate(self) -> Result[unit, Error] = checked(c.terminate(self.h.raw()))
+    terminate(self) -> Result[unit, Error] = checked(c.terminate(self.raw()))
 
     // The platform's own window object — an `NSWindow` on macOS, a `GtkWindow` on Linux, an `HWND`
     // on Windows. A bare address, because what to do with one is not something this package can
     // help with.
-    native_window(self) -> *u8 = c.get_window(self.h.raw())
+    native_window(self) -> *u8 = c.get_window(self.raw())
 end Webview
+
+impl Drop for Webview
+    drop(self)
+        c.destroy(self.w)
+    end drop
 
 // Opens a webview.
 //
@@ -359,7 +360,7 @@ end Webview
 //     w.bind("save", (args) -> Ok("null"))?
 //     w.html(page)?
 //     w.run()?
-webview(debug: bool = false) -> Result[Webview, Error]
+webview(debug: bool = false) -> Result[&Webview, Error]
     val w = c.create(if debug then 1 else 0, ptr_cast(0usize))
 
     // **A null here is almost always the engine missing**, not a programming mistake: WebView2 not
@@ -367,7 +368,7 @@ webview(debug: bool = false) -> Result[Webview, Error]
     // all, so this is the binding's own reading of the situation rather than a code it was given.
     if usize(w) == 0 then return Err(MissingDependency)
 
-    Ok(Webview(WebviewHandle(w, buf())))
+    Ok(Webview(w, buf()))
 
 // The version of webview this program is linked against, as major, minor and patch.
 //
