@@ -558,7 +558,7 @@ webview(debug: bool = false) -> Result[&Webview, Error]
 //
 // It is here rather than in the test file because the constructor names `w`, which is private to
 // this file.
-private[webview] headless() -> Webview = Webview(ptr_cast(0usize), buf(), buf(), buf(), None)
+private[webview] headless() -> &Webview = Webview(ptr_cast(0usize), buf(), buf(), buf(), None)
 
 // The version of webview this program is linked against, as major, minor and patch.
 //
