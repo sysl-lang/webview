@@ -113,3 +113,122 @@ private pump_now() -> Result[int, Error]
     val handled = c.pump()
 
     if handled < 0 then Err(InvalidState) else Ok(handled)
+
+// ## A registration has to land on the CALLER's webview, not on a copy of it
+//
+// **The receiver is the whole of what the next three check.** `bind`, `bind_async` and `dispatch`
+// each build a `&` box, push it onto one of the webview's lists, and hand C the bare address inside
+// it. Written with a `self` receiver they push onto a *copy* of the handle — `reference/
+// declarations.md` gives `self` one meaning, *by value* — and the copy is released when the method
+// returns, leaving C holding the address of a box nothing owns. The caller's list is the observable
+// half of that, and it is what these assert on: empty afterwards is the defect, one entry is the fix.
+//
+// **A null `*c.Webview` is what makes it checkable with no window**, and `headless()` is where that
+// is explained: the C call is really made, is really refused, and refuses without faulting, which
+// leaves the sysl either side of it — the half that can be wrong — as the only thing under test.
+//
+// Somewhere for a trampoline's closure to leave a mark. A closure captures by value, so this has to
+// be behind a `&` for the test to see what happened — the same fact about copies that the three
+// receivers below are about.
+private struct Seen
+    calls: int
+    call: string
+    request: string
+
+    saw(*self, call: string, request: string)
+        self.calls += 1
+        self.call = call
+        self.request = request
+
+@test("a bind registration is kept by the caller's webview, not by a copy of it")
+bind_keeps_the_box_on_the_caller()
+    var w = headless()
+    val seen: &Seen = Seen(0, "", "")
+
+    assert_eq(w.kept_bindings(), 0usize, "nothing is registered yet")
+
+    val outcome = w.bind("add", (args) ->
+        seen.saw("", args)
+
+        Ok("3"))
+
+    outcome match
+        Ok(_)  -> assert(false, "a null handle should have been refused")
+        Err(e) -> assert_eq(e.code(), c.INVALID_ARGUMENT, "and refused as an invalid argument")
+
+    assert_eq(w.kept_bindings(), 1usize, "the box is on the caller's list, which is what keeps it alive")
+
+    // The address C was handed, recovered the way the trampoline will be handed it, and fed to the
+    // trampoline directly — which is the page's call without the page.
+    val arg = w.binding_arg(0usize)
+
+    var id: []u8 = [0; 2]
+    id[0] = 0x31
+
+    var req: []u8 = [0; 4]
+    req[0] = 0x5b
+    req[1] = 0x32
+    req[2] = 0x5d
+
+    on_bound(&id[0], &req[0], arg)
+
+    // webview owns both buffers and frees them when the trampoline returns, so a closure that kept
+    // what it was handed would be keeping C's storage. Overwriting them here is that freeing, and the
+    // strings the closure recorded have to be untouched by it.
+    req[0] = 0x58
+
+    assert_eq(seen.calls, 1, "the trampoline reached the closure through the box the webview keeps")
+    assert_eq(seen.request, "[2]", "and the request is a sysl string that owns its bytes")
+
+@test("a bind_async registration is kept by the caller's webview, not by a copy of it")
+bind_async_keeps_the_box_on_the_caller()
+    var w = headless()
+    val seen: &Seen = Seen(0, "", "")
+
+    assert_eq(w.kept_async_bindings(), 0usize, "nothing is registered yet")
+
+    val outcome = w.bind_async("load", (call, request) -> seen.saw(call, request))
+
+    outcome match
+        Ok(_)  -> assert(false, "a null handle should have been refused")
+        Err(e) -> assert_eq(e.code(), c.INVALID_ARGUMENT, "and refused as an invalid argument")
+
+    assert_eq(w.kept_async_bindings(), 1usize, "the box is on the caller's list")
+
+    val arg = w.async_binding_arg(0usize)
+
+    var id: []u8 = [0; 4]
+    id[0] = 0x37
+    id[1] = 0x38
+    id[2] = 0x39
+
+    var req: []u8 = [0; 4]
+    req[0] = 0x5b
+    req[1] = 0x31
+    req[2] = 0x5d
+
+    on_bound_async(&id[0], &req[0], arg)
+
+    // The id matters more here than it does for `bind`: a deferred answer keeps it and calls
+    // `answer` with it a turn later, long after webview has freed the buffer it arrived in.
+    id[0] = 0x58
+    req[0] = 0x58
+
+    assert_eq(seen.calls, 1, "the trampoline reached the closure through the box the webview keeps")
+    assert_eq(seen.call, "789", "the call id is copied out of C, which is what lets it be kept")
+    assert_eq(seen.request, "[1]", "and so are the arguments")
+
+@test("a dispatched closure is kept by the caller's webview, not by a copy of it")
+dispatch_keeps_the_box_on_the_caller()
+    var w = headless()
+    val seen: &Seen = Seen(0, "", "")
+
+    assert_eq(w.queued_work(), 0usize, "nothing is queued yet")
+
+    val outcome = w.dispatch(() -> seen.saw("", ""))
+
+    outcome match
+        Ok(_)  -> assert(false, "a null handle should have been refused")
+        Err(e) -> assert_eq(e.code(), c.INVALID_ARGUMENT, "and refused as an invalid argument")
+
+    assert_eq(w.queued_work(), 1usize, "the work is on the caller's list until the loop has run it")

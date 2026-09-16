@@ -203,10 +203,22 @@ The hazard the split was avoiding is real: constructing a fresh value around the
 out a second owner and so a second `webview_destroy`. What removes it is `&self` rather than a
 second type.
 
-Nothing here actually needs `&self` today, because a `Webview` hands nothing that outlives a call
-back to a caller — the closures it keeps are stored on itself. `sysl-lang/lmdb`, whose transactions
-*are* handed out, is where the receiver does real work; `reference/declarations.md § A '&self'
-method may keep what it was called on` is where the form is written down.
+**A method that stores something takes `*self`, and until v0.3.1 three of them took `self`.** A
+receiver written `self` is *by value — the method gets a copy*, so `bind`, `bind_async` and
+`dispatch` each built their box, pushed it onto **the copy's** list, and returned; the copy died with
+the call and released the only strong reference, while webview kept the bare address the push had
+handed back. The caller's `Webview` held nothing. The first time a page called a bound name the
+trampoline read a freed closure and the process died in `binding_ctx_t::call`, eighteen frames under
+a `pump`. This section used to close by saying nothing here needed a real receiver, *because the
+closures it keeps are stored on itself* — which is exactly why the receiver has to write through to
+the caller's value, and not a reason it need not.
+
+`*self` rather than `&self`: a counted receiver is refused on a stack value, which would make the
+type unusable unboxed and untestable without a window, and `*self` is identical to `&self` when the
+call comes through a box. A method that stores nothing — `title`, `answer`, `closed` — keeps `self`.
+`sysl-lang/lmdb`, whose transactions *are* handed out to a caller, is where `&self` does real work;
+`reference/declarations.md § A '&self' method may keep what it was called on` is where that form is
+written down.
 
 ## Testing — and this is the honest part
 
@@ -214,14 +226,23 @@ method may keep what it was called on` is where the form is written down.
 sysl test .
 ```
 
-**9 passed, 0 failed.** They cover the struct layout against the C, the version the library reports,
+**12 passed, 0 failed.** They cover the struct layout against the C, the version the library reports,
 every error code and its round trip, the size hints, that all three trampolines have addresses C can
-call, and — the two that are new in 0.3.0 — that `pump` takes a real turn of the platform's event
-loop and that two hundred turns of an idle one dispatch nothing.
+call, that `pump` takes a real turn of the platform's event loop and that two hundred turns of an
+idle one dispatch nothing, and — the three that are new in 0.3.1 — that a registration made by
+`bind`, `bind_async` or `dispatch` is on **the caller's** webview afterwards, and that both
+trampolines hand their closure sysl strings rather than C's buffers.
 
 **The pump is the one thing here that needs no window**, the platform's event loop belonging to the
 process rather than to a window, so those two are real end-to-end checks of the shim: it compiled, it
 linked, sysl reached it, and it found the platform's symbols.
+
+**A null `webview_t` is the other**, and it is what lets the receiver be checked at all. Every entry
+point in webview's C API runs its work inside an `api_filter`, and the `cast_to_webview` a null
+handle fails is a C++ `throw` that filter catches and reports as `WEBVIEW_ERROR_INVALID_ARGUMENT`.
+So a `bind` on a handle with nothing behind it really reaches C, is really refused, and refuses
+without faulting — which leaves the sysl either side of it, the half that was wrong, as the only
+thing under test.
 
 > **They do not open a window, and they cannot.** `webview_create` calls `[NSApplication run]` and
 > blocks until the application-did-finish-launching notification, which never arrives in a session
@@ -257,8 +278,8 @@ SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .
 
 Covers **the sysl half and `pump.c`** — webview itself arrives through `pkg_config`, so its objects
 are somebody else's build and no flag of ours instruments them, but the shim is C in this tree and so
-is compiled with the flag like any vendored source. Clean at 0.3.0, with `__asan_memcpy` in
-`nm -u` to say the binary was really instrumented.
+is compiled with the flag like any vendored source. Clean at 0.3.1 — 12 passed, 0 failed — with
+nineteen `asan` symbols in `nm -u` to say the binary was really instrumented.
 
 > **Before sysl 0.0.104** a green ASan run over an unchanged tree proved nothing: `sysl test` cached
 > its artifact and the key did not include `SYSL_EXTRA_CFLAGS`, so the uninstrumented binary was

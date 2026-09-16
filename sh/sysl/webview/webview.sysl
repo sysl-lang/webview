@@ -251,13 +251,26 @@ private[webview] on_dispatch(w: *c.Webview, arg: *u8)
 // rather than a second owner. It had been in the language the whole time; nobody tried it, and the
 // workaround worked, so nothing ever failed to say otherwise.
 //
-// Nothing here needs `&self` today, because a `Webview` hands nothing that outlives a call back to a
-// caller — the closures it keeps are stored on itself. What the collapse buys is one type instead of
-// two and a paragraph that no longer teaches a contortion. `sysl-lang/lmdb`, whose transactions
-// *are* handed out, is where the receiver does real work.
+// ==A method that stores something here takes `*self`, and "stored on itself" is the reason==
 //
-// `reference/declarations.md § A '&self' method may keep what it was called on` is where the form is
-// written down.
+// `reference/declarations.md` gives `self` one meaning, and it is not a weaker `*self`: **by value —
+// the method gets a copy**. So a registering method written `bind(self, …)` builds its box, pushes
+// it onto *the copy's* list, and returns; the copy dies with the call and releases the only strong
+// reference to the box, while C keeps the address the push handed back. The caller's webview holds
+// nothing, and the first time the page calls the name the trampoline reads freed storage. That the
+// closures are stored *on itself* is exactly why the receiver has to write through to the caller's
+// value, rather than a reason it need not.
+//
+// **`*self` is the receiver — by pointer — and not `&self`.** A counted receiver is refused on a
+// stack value, which would make this type unusable unboxed and untestable without a window; `*self`
+// is identical to `&self` when the call comes through a box, and works on a stack value as well. It
+// is what `keep_bound`, `keep_bound_async` and `keep_work` already take, and `bind`, `bind_async`
+// and `dispatch` now take it for the same reason. A method that stores nothing — `title`, `answer`,
+// `closed` — keeps `self`, and should: a `*self` method cannot be called on a `val`.
+//
+// `sysl-lang/lmdb`, whose transactions *are* handed out to a caller, is where `&self` does real
+// work; `reference/declarations.md § A '&self' method may keep what it was called on` is where that
+// form is written down.
 struct Webview
     private w: *c.Webview
 
@@ -305,6 +318,29 @@ struct Webview
                 self.work.truncate(self.work.len() - 1)
 
                 return
+
+    // ==What the package's own tests look at, and why it is here rather than in them==
+    //
+    // **That a registration landed on the caller's webview is a fact about a private field**, and
+    // the fields above are private to this file — so a check of it has to be given a seam, or be
+    // given a window instead, and this package can open no window. These five are that seam:
+    // `private[webview]`, so the package sees them and a consumer cannot, answering a count and a
+    // bare address rather than handing out a box.
+    //
+    // They are cheap in a way a wider `private[webview]` on the fields themselves would not be:
+    // nothing here can *change* a list, so the invariant that only `keep_*` and `forget_work` write
+    // to them still holds by inspection of this file alone.
+    private[webview] kept_bindings(self) -> usize = self.bound.len()
+
+    private[webview] kept_async_bindings(self) -> usize = self.bound_async.len()
+
+    private[webview] queued_work(self) -> usize = self.work.len()
+
+    // The address C was handed for registration `i`, recovered exactly as `keep_bound` produced it —
+    // so feeding it to `on_bound` is the page's call with the page left out.
+    private[webview] binding_arg(self, i: usize) -> *u8 = ptr_cast(&*self.bound.at(i))
+
+    private[webview] async_binding_arg(self, i: usize) -> *u8 = ptr_cast(&*self.bound_async.at(i))
 
     // The window's title.
     title(self, text: string) -> Result[unit, Error]
@@ -359,7 +395,7 @@ struct Webview
     // **The closure is kept for the life of the webview.** It has to be: the page may call it at any
     // moment until the window closes, and nothing on this side can know when the last call has been
     // made. `unbind` stops the page seeing the name and deliberately does not release the closure.
-    bind(self, name: string, f: &Fn(string) -> Answer) -> Result[unit, Error]
+    bind(*self, name: string, f: &Fn(string) -> Answer) -> Result[unit, Error]
         val b: &Bound = Bound(self.raw(), f)
         val arg = self.keep_bound(b)
         val n = cstring(name)
@@ -383,7 +419,7 @@ struct Webview
     // The id is a sysl string and owns its bytes, so it may be kept for as long as the program
     // likes. Answering twice is webview's `NotFound` on the second; never answering leaves the
     // page's promise pending for ever, exactly as a JavaScript promise nobody settles would be.
-    bind_async(self, name: string, f: &Fn(string, string) -> unit) -> Result[unit, Error]
+    bind_async(*self, name: string, f: &Fn(string, string) -> unit) -> Result[unit, Error]
         val b: &BoundAsync = BoundAsync(f)
         val arg = self.keep_bound_async(b)
         val n = cstring(name)
@@ -420,7 +456,7 @@ struct Webview
     //
     // **The closure is released once it has run**, as of v0.3.0 — it is kept only until then, which
     // is as long as its address has to stay good. A program may dispatch as often as it likes.
-    dispatch(&self, f: &Fn() -> unit) -> Result[unit, Error]
+    dispatch(*self, f: &Fn() -> unit) -> Result[unit, Error]
         val k: &Work = Work(self.self_ref, f)
         val arg = self.keep_work(k)
 
@@ -510,6 +546,19 @@ webview(debug: bool = false) -> Result[&Webview, Error]
     wv.self_ref = wv
 
     Ok(wv)
+
+// A webview with nothing behind it — a null `*c.Webview` — for the package's own tests, which run
+// on machines with no window server at all.
+//
+// **It is safe to call anything on**, which is not luck: every entry point in webview's C API runs
+// its work inside an `api_filter`, and the `cast_to_webview` a null handle fails is a C++ `throw`
+// that filter catches and reports as `WEBVIEW_ERROR_INVALID_ARGUMENT`. So a call on one is really
+// made, is refused, and refuses without faulting — including `webview_destroy`, which is what lets
+// one simply go out of scope.
+//
+// It is here rather than in the test file because the constructor names `w`, which is private to
+// this file.
+private[webview] headless() -> Webview = Webview(ptr_cast(0usize), buf(), buf(), buf(), None)
 
 // The version of webview this program is linked against, as major, minor and patch.
 //
