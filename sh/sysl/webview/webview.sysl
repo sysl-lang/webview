@@ -146,10 +146,16 @@ type Answer = Result[string, string]
 // One registration of a page-callable function: the webview to answer through, and the closure to
 // run.
 //
-// **It is boxed and kept alive by the handle**, because what crosses to C is its *address* in the
-// `void *` webview hands back to the trampoline, and a raw pointer keeps nothing alive by itself.
-// This is the shape `~/dev/sysl-lang/CLAUDE.md` prescribes for a callback-driven library with a
-// user-data slot.
+// **It is boxed and THE BOX ITSELF is kept by the handle**, because what crosses to C is its
+// *address* in the `void *` webview hands back to the trampoline, and a raw pointer keeps nothing
+// alive by itself. This is the shape `~/dev/sysl-lang/CLAUDE.md` prescribes for a callback-driven
+// library with a user-data slot.
+//
+// **Until v0.3.0 the handle kept the ADDRESS and not the box**, which is not the same thing at all:
+// a `Buf[usize]` holds integers, so the only reference to a registration died with the `bind` call
+// that made it, and every page callback afterwards read freed storage. Nothing showed it, because
+// the one thing that would — a page calling a bound name — needs a window, and no test in this
+// package can open one.
 //
 // The webview is held as a raw `*c.Webview` rather than as a `&Webview` on purpose: a strong
 // reference here would be a cycle — the webview owns this — and a cycle is the one thing counting
@@ -187,8 +193,35 @@ private[webview] on_bound(id: *u8, req: *u8, arg: *u8)
 
     c.ret((*bound).w, call.ptr, status, out.ptr)
 
-// One deferred piece of work, boxed for the same reason a `Bound` is.
+// One registration of a page-callable function that answers LATER.
+//
+// It carries no webview, because it answers nothing itself: the closure is handed the call's id and
+// the program calls `answer` with it whenever it is ready — a turn later, a request later, never.
+private struct BoundAsync
+    private f: &Fn(string, string) -> unit
+end BoundAsync
+
+// The trampoline a `bind_async` registration goes through.
+//
+// **Both strings are COPIED out of C before the closure runs**, which is what makes a deferred
+// answer possible at all: webview owns the id and frees it when this returns, so a closure keeping
+// the id it was handed would be keeping a dangling pointer. `from_cstring` answers a sysl string,
+// which owns its bytes.
+private[webview] on_bound_async(id: *u8, req: *u8, arg: *u8)
+    val bound: *BoundAsync = ptr_cast(arg)
+
+    val call = from_cstring(id).unwrap_or("")
+    val request = from_cstring(req).unwrap_or("[]")
+
+    (*bound).f(call, request)
+
+// One deferred piece of work, boxed for the same reason a `Bound` is — and, unlike a `Bound`, taken
+// off the webview's list the moment it has run.
+//
+// The edge back to the webview is **`weak`**, which is the org file's rule for the back-edge from a
+// registered closure to the handle that keeps it: a strong one would be a cycle.
 private struct Work
+    private owner: weak Webview
     private f: &Fn() -> unit
 end Work
 
@@ -198,6 +231,13 @@ private[webview] on_dispatch(w: *c.Webview, arg: *u8)
     val work: *Work = ptr_cast(arg)
 
     (*work).f()
+
+    // **The box is released here, and that is the whole of the fix for what v0.2.0 documented as a
+    // cost it could not avoid.** A `Work` has run and can never run again, so nothing needs it; the
+    // reason it used to be kept was that there was nowhere to take it off from.
+    (*work).owner.get() match
+        Some(wv) -> wv.forget_work(usize(arg))
+        None -> ()
 
 // A window with a browser engine in it, its C pointer, and everything boxed that C holds a bare
 // address of.
@@ -221,27 +261,50 @@ private[webview] on_dispatch(w: *c.Webview, arg: *u8)
 struct Webview
     private w: *c.Webview
 
-    // Every boxed closure C holds the address of. **Nothing is ever removed**, and that is the
-    // decision this field represents: a `Bound` has to live as long as the page can call it, which
-    // is as long as the webview, and `unbind` cannot know whether a call is in flight. A `Work` is
-    // kept on the same list for want of a way to take it off safely — see `dispatch`.
-    private live: Buf[usize]
+    // Every boxed closure C holds the address of, **and these are the boxes themselves**: a raw
+    // pointer keeps nothing, so the strong reference has to live here.
+    //
+    // **A registration is never removed and a piece of work always is**, which is the difference the
+    // three lists are here to draw. A `Bound` has to live as long as the page can call it, which is
+    // as long as the webview — `unbind` cannot know whether a call is in flight. A `Work` has run by
+    // the time the trampoline comes back and can never run again.
+    private bound: Buf[&Bound]
+    private bound_async: Buf[&BoundAsync]
+    private work: Buf[&Work]
+
+    // The weak edge a `Work` needs back to here, so that it can take itself off `work`.
+    private self_ref: weak Webview
 
     private raw(self) -> *c.Webview = self.w
 
     private keep_bound(*self, b: &Bound) -> *u8
-        val p: *u8 = ptr_cast(&*b)
+        self.bound.push(b)
 
-        self.live.push(usize(p))
+        ptr_cast(&*b)
 
-        p
+    private keep_bound_async(*self, b: &BoundAsync) -> *u8
+        self.bound_async.push(b)
+
+        ptr_cast(&*b)
 
     private keep_work(*self, k: &Work) -> *u8
-        val p: *u8 = ptr_cast(&*k)
+        self.work.push(k)
 
-        self.live.push(usize(p))
+        ptr_cast(&*k)
 
-        p
+    // Takes the `Work` at `at` off the list, which releases it. Reached from `on_dispatch` through
+    // the weak edge, and from nowhere else.
+    private[webview] forget_work(*self, at: usize)
+        for i in 0..<self.work.len()
+            val k = self.work.at(i)
+            val p: *u8 = ptr_cast(&*k)
+
+            if usize(p) == at
+                // The order does not matter, so the last one takes the gap.
+                self.work.set(i, self.work.at(self.work.len() - 1))
+                self.work.truncate(self.work.len() - 1)
+
+                return
 
     // The window's title.
     title(self, text: string) -> Result[unit, Error]
@@ -303,6 +366,45 @@ struct Webview
 
         checked(c.bind(self.raw(), n.ptr, &on_bound, arg))
 
+    // Makes `name` an asynchronous function on the page's `window`, **answered whenever the program
+    // is ready rather than when the closure returns**.
+    //
+    // The closure is handed the call's **id** and its arguments, and answers nothing. The program
+    // calls `answer(id, …)` later — the next turn of its own loop, after a file has been read, after
+    // a request has come back — and that is what resolves the page's promise:
+    //
+    //     w.bind_async("load", (call, args) ->
+    //         read_file(path, (bytes) -> w.answer(call, Ok(as_json(bytes))).unwrap()))?
+    //
+    // **This is the one form a program with its own event loop can use.** A `bind` closure has to
+    // produce the whole answer before it returns, so anything it waits for is waited for with the
+    // window frozen; the page's promise does not care when it is settled.
+    //
+    // The id is a sysl string and owns its bytes, so it may be kept for as long as the program
+    // likes. Answering twice is webview's `NotFound` on the second; never answering leaves the
+    // page's promise pending for ever, exactly as a JavaScript promise nobody settles would be.
+    bind_async(self, name: string, f: &Fn(string, string) -> unit) -> Result[unit, Error]
+        val b: &BoundAsync = BoundAsync(f)
+        val arg = self.keep_bound_async(b)
+        val n = cstring(name)
+
+        checked(c.bind(self.raw(), n.ptr, &on_bound_async, arg))
+
+    // Resolves or rejects the page's promise for a call a `bind_async` closure was handed.
+    //
+    // `Ok` resolves and `Err` rejects, both with raw JSON, exactly as a `bind` closure's answer does.
+    // **It is safe from another thread**, which is the one thing in this package besides `dispatch`
+    // that is.
+    answer(self, call: string, result: Answer) -> Result[unit, Error]
+        val (status, text) = result match
+            Ok(value) -> (0, value)
+            Err(why)  -> (1, why)
+
+        val id = cstring(call)
+        val out = cstring(text)
+
+        checked(c.ret(self.raw(), id.ptr, status, out.ptr))
+
     // Takes `name` off the page's `window`. The closure that was registered is not released — see
     // `bind`.
     unbind(self, name: string) -> Result[unit, Error]
@@ -316,12 +418,10 @@ struct Webview
     // worker reaches `eval` or `title` — every other method on this type has to be called from the
     // thread that made the webview.
     //
-    // **The closure is kept for the life of the webview**, as a `bind`'s is, and unlike a `bind`'s
-    // that is a genuine cost rather than a necessity: a program that dispatches once per frame grows
-    // its retained set forever. Dispatch occasionally — to hand a finished result back to the window
-    // — and let the page drive anything that happens every frame.
-    dispatch(self, f: &Fn() -> unit) -> Result[unit, Error]
-        val k: &Work = Work(f)
+    // **The closure is released once it has run**, as of v0.3.0 — it is kept only until then, which
+    // is as long as its address has to stay good. A program may dispatch as often as it likes.
+    dispatch(&self, f: &Fn() -> unit) -> Result[unit, Error]
+        val k: &Work = Work(self.self_ref, f)
         val arg = self.keep_work(k)
 
         checked(c.dispatch(self.raw(), &on_dispatch, arg))
@@ -329,6 +429,42 @@ struct Webview
     // **Runs the window, and does not return until it closes** or `terminate` is called. It must be
     // called on the thread that made the webview.
     run(self) -> Result[unit, Error] = checked(c.run(self.raw()))
+
+    // **One turn of the platform's event loop, taken from inside somebody else's** — and the reason
+    // this package can be used by a program that already has a loop of its own.
+    //
+    // `run` takes the thread and does not give it back, so a program built on libuv has to choose
+    // between its own loop and the window. It does not: it keeps its loop and calls this from a
+    // repeating timer, which is what `uv_run(UV_RUN_NOWAIT)` would be if the roles were reversed.
+    //
+    //     val w = webview()?
+    //
+    //     w.html(page)?
+    //     tick.start(0, 8, () -> w.pump().unwrap())?     // 8 ms is about 120 Hz
+    //     lp.run()?
+    //
+    // It answers how many platform events it handled and **returns at once**, whether that was none
+    // or sixty-four; sixty-four is the cap, so a burst can never hold the caller's own loop.
+    //
+    // **`run` and `pump` are alternatives and a program picks one.** Nothing here stops a program
+    // calling both, and nothing good comes of it.
+    //
+    // **It needs no window and may be called before there is one**, the platform's event loop
+    // belonging to the process rather than to a window — which is what makes it testable on a
+    // machine with no window server at all.
+    //
+    // **`InvalidState` means the platform's loop could not be reached**, which is a platform this
+    // package has no pump for. It is not what an idle loop answers; an idle loop answers `Ok(0)`.
+    pump(self) -> Result[int, Error]
+        val handled = c.pump()
+
+        if handled < 0 then Err(InvalidState) else Ok(handled)
+
+    // Whether the window has gone — because the user closed it, or because `terminate` was called.
+    //
+    // **A program pumping its own loop needs this and a program calling `run` does not**: `run`
+    // returns when the window closes and a pump never does, so this is what ends the loop.
+    closed(self) -> bool = usize(c.get_window(self.raw())) == 0
 
     // Stops `run`. Safe to call from a `bind` callback, which is the usual way an application closes
     // itself.
@@ -368,7 +504,12 @@ webview(debug: bool = false) -> Result[&Webview, Error]
     // all, so this is the binding's own reading of the situation rather than a code it was given.
     if usize(w) == 0 then return Err(MissingDependency)
 
-    Ok(Webview(w, buf()))
+    var wv: &Webview = Webview(w, buf(), buf(), buf(), None)
+
+    // The weak edge back, which a dispatched `Work` follows to take itself off the list.
+    wv.self_ref = wv
+
+    Ok(wv)
 
 // The version of webview this program is linked against, as major, minor and patch.
 //

@@ -64,8 +64,52 @@ hints()
 // window — but a trampoline that could not have its address taken would fail to compile, and this
 // is what pins that it can. It is the fact that decides whether a `bind` can be a closure at all:
 // every parameter is a pointer, so no `@export` is needed.
-@test("both trampolines have addresses C can call")
+@test("all three trampolines have addresses C can call")
 trampolines_are_addressable()
     assert(usize(&on_bound) != 0, "the bind trampoline")
+    assert(usize(&on_bound_async) != 0, "the bind_async trampoline")
     assert(usize(&on_dispatch) != 0, "the dispatch trampoline")
-    assert(usize(&on_bound) != usize(&on_dispatch), "and they are two different functions")
+
+    assert(usize(&on_bound) != usize(&on_bound_async), "bind and bind_async are two functions")
+    assert(usize(&on_bound) != usize(&on_dispatch), "and so are bind and dispatch")
+
+// ## The pump is the one new thing a machine with no window server CAN check
+//
+// **It needs no window** — it drives the application's event loop, which exists as soon as the
+// process has the platform's toolkit in it, and `@link("webview")` puts that toolkit in every
+// program built against this package. So a headless run really does take a turn of a real
+// `NSApplication` loop and really does answer how many events were on it, which is none.
+//
+// That makes this a falsifiable check of the whole path: the shim compiled, it linked, sysl reached
+// it through `extern`, and it found the platform's symbols. A `-1` here would mean it found none.
+//
+// **What cannot be tested here**: that a pumped loop delivers a click, that `eval` reaches the page
+// between pumps, that a `bind_async` answer resolves the page's promise, and what a pump costs while
+// the window sits idle. Every one needs a window, and a window needs a window server. The README
+// says which program checks those and who has to run it.
+@test("the pump takes a real turn of the platform's loop with no window open")
+pump_runs_without_a_window()
+    pump_now() match
+        Ok(handled) -> assert(handled >= 0, "a turn answers how many events it dispatched")
+        Err(e)      -> assert(false, f"the platform's loop should be reachable here: ${e}%s")
+
+// Pumping is what a program does a hundred times a second, so it has to be repeatable and it has to
+// leave nothing behind. The count is what says the drain terminates: an idle loop has no events, so
+// a pump that answered a non-zero count every time would be dispatching something of its own.
+@test("pumping again and again is idle work and stays idle")
+pumping_is_repeatable()
+    var total = 0
+
+    for i in 0..<200
+        pump_now() match
+            Ok(handled) -> total += handled
+            Err(e)      -> assert(false, f"turn ${i}%d: ${e}%s")
+
+    assert_eq(total, 0, "two hundred turns of an idle loop dispatch nothing")
+
+// The pump as a free call. `Webview.pump` is the same two lines with a receiver in front of them —
+// the platform has one event loop however many windows are on it.
+private pump_now() -> Result[int, Error]
+    val handled = c.pump()
+
+    if handled < 0 then Err(InvalidState) else Ok(handled)

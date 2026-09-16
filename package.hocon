@@ -1,9 +1,12 @@
 package {
   name    = "webview"
-  version = "0.2.0"
+  version = "0.3.0"
 
   // `Webview` is a `Drop` type whose constructor answers `&T`, which 0.0.91's `DropReturnCheck` is
   // what keeps honest.
+  //
+  // **This is a FLOOR and does not move with a release.** 0.3.0 added a `weak Webview` back-edge and
+  // a `Buf[&T]` of boxed closures, both of which 0.0.91 already had.
   sysl = "0.0.91"
 }
 
@@ -15,6 +18,12 @@ package {
 // **`heap`, because the binding allocates.** A `CString` for every call that takes text, and a boxed
 // closure for every `bind` — all of it sysl storage with a lifetime, which is what keeps this side
 // from ever having to free what webview handed back.
+//
+// **There is C in this tree as of 0.3.0, and it is not webview's.** `sh/sysl/webview/c/pump.c` is one
+// turn of the *platform's* event loop, which webview publishes no way to ask for and which a program
+// that owns its own loop needs. It links nothing: every symbol it uses is reached with `dlsym` out of
+// what `libwebview` has already loaded, because a `@link` directive goes on every consumer's line on
+// every platform and the toolkits differ per platform.
 requires {
   heap  = true
   posix = true

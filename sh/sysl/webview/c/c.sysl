@@ -2,6 +2,7 @@ module sh.sysl.webview.c
 @link("webview")
 @include("<stddef.h>")
 @include("<webview/api.h>")
+@include("pump.h")
 
 // webview as C declares it, and nothing else.
 //
@@ -151,3 +152,11 @@ extern "webview_unbind" unbind(w: *Webview, name: *u8) -> int
 extern "webview_return" ret(w: *Webview, id: *u8, status: int, result: *u8) -> int
 
 extern "webview_version" version() -> *VersionInfo
+
+// ## The eighteenth entry point, which is not webview's
+//
+// **webview publishes no way to take ONE turn of the loop**, and a program that already owns its
+// thread needs exactly that. `pump.c` beside this file is the whole of it — the platform's own
+// event loop, driven once and non-blocking. See `pump.h` for why it reaches its symbols the way it
+// does, and `sh.sysl.webview`'s `pump` for what a program writes.
+extern "sysl_webview_pump" pump() -> int

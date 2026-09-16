@@ -98,16 +98,66 @@ binding is announced to a page that needs it early.
 **Nothing here parses or builds JSON**, deliberately: a binding that picked a JSON library would pick
 it for every consumer. `sh.sysl.json` is one import away.
 
-### Closures are retained
+### Closures are retained — a bound one for ever, a dispatched one until it has run
 
 A bound closure is kept for the life of the webview. It has to be — the page may call it at any
 moment until the window closes, and nothing on this side can know when the last call was made.
 `unbind` stops the page seeing the name and does not release the closure.
 
-`dispatch(f)` — the one method safe to call from another thread — retains its closure too, and there
-that is a real cost rather than a necessity: **a program that dispatches once per frame grows its
-retained set forever.** Dispatch occasionally, to hand a finished result back to the window, and let
-the page drive anything per-frame.
+`dispatch(f)` — the one method safe to call from another thread — **releases its closure once it has
+run**, as of 0.3.0. It used to be kept on the same list a binding is on, so a program dispatching
+once a frame grew its retained set for ever; there is no longer a reason to dispatch sparingly.
+
+## A program that already has an event loop: `pump`
+
+**`run` takes the thread and does not give it back**, which is the whole of the problem for a program
+built on libuv, or on anything else with a loop of its own. Such a program keeps its loop and takes
+one turn of the *platform's* loop from inside it:
+
+```sysl
+val w = open_window()?
+
+w.html(page)?
+
+tick.start(0, 8, () ->                 // a libuv timer, about 120 Hz
+    w.pump().unwrap()
+
+    if w.closed()
+        lp.stop())?
+
+lp.run()?                              // the ordinary libuv loop, which knows nothing about windows
+```
+
+- **`pump()`** handles whatever the platform has already delivered and returns at once, answering how
+  many events it dispatched. Sixty-four is the cap, so a burst cannot hold up the caller's own timers.
+- **`closed()`** is what ends the loop, since a pump never returns of its own accord the way `run`
+  does.
+- **`run` and `pump` are alternatives.** Pick one.
+
+**The tick is the latency**, so 8 ms is a click answered within 8 ms; an idle process at that rate
+costs nothing measurable.
+
+`pump.c` is the only thing in this package that is not webview — webview publishes no way to take a
+single turn, so it is taken against the platform: `nextEventMatchingMask:` + `sendEvent:` on macOS,
+`g_main_context_iteration` on GTK, `PeekMessage`/`DispatchMessage` on Windows. **Dequeuing alone is
+not enough on macOS**: running the run loop without `sendEvent:` draws the window and answers no
+clicks. Every symbol is reached with `dlsym` rather than linked, because a `@link` goes on every
+consumer's line on every platform and `-lobjc` is not a thing a Linux box has.
+
+### A page's call answered later: `bind_async`
+
+A `bind` closure has to produce the whole answer before it returns, so anything it waits for is
+waited for with the window frozen. `bind_async` hands the closure the call's **id** instead and
+answers nothing; the program calls `answer(id, …)` whenever it likes.
+
+```sysl
+w.bind_async("load", (call, args) ->
+    read_file(path, (bytes) -> w.answer(call, Ok(as_json(bytes))).unwrap()))?
+```
+
+The id is a sysl string and owns its bytes, so it may be kept for as long as the program wants — a
+turn, a request, a second. Never answering leaves the page's promise pending, exactly as an unsettled
+JavaScript promise would be; answering twice is `NotFound` on the second.
 
 ## The boundary
 
@@ -164,9 +214,14 @@ method may keep what it was called on` is where the form is written down.
 sysl test .
 ```
 
-**7 passed, 0 failed.** They cover the struct layout against the C, the version the library reports,
-every error code and its round trip, the size hints, and that both trampolines have addresses C can
-call.
+**9 passed, 0 failed.** They cover the struct layout against the C, the version the library reports,
+every error code and its round trip, the size hints, that all three trampolines have addresses C can
+call, and — the two that are new in 0.3.0 — that `pump` takes a real turn of the platform's event
+loop and that two hundred turns of an idle one dispatch nothing.
+
+**The pump is the one thing here that needs no window**, the platform's event loop belonging to the
+process rather than to a window, so those two are real end-to-end checks of the shim: it compiled, it
+linked, sysl reached it, and it found the platform's symbols.
 
 > **They do not open a window, and they cannot.** `webview_create` calls `[NSApplication run]` and
 > blocks until the application-did-finish-launching notification, which never arrives in a session
@@ -175,10 +230,24 @@ call.
 > that opened a window would **hang rather than fail**, which is the worst way for a test to be
 > wrong.
 
-So the suite proves the boundary and nothing past `create`. **Everything else is proven by
-[`sysl-lang/webview-demo`](https://github.com/sysl-lang/webview-demo)**, which opens a window, binds
-two sysl closures, and lets a page call them — run from a terminal in a graphical session. If you
-are evaluating this package, run that, because it is the part the green tick above does not cover.
+So the suite proves the boundary, the pump, and nothing else past `create`. **Everything else is
+proven by [`sysl-lang/webview-demo`](https://github.com/sysl-lang/webview-demo)**, which opens a
+window, binds two sysl closures, and lets a page call them — run from a terminal in a graphical
+session. If you are evaluating this package, run that, because it is the part the green tick above
+does not cover.
+
+> **On a shared Mac, "a graphical session" means the account that is logged in at the console.** A
+> shell belonging to any other account has no `Aqua` session however ordinary it looks, so
+> `webview_create` hangs there exactly as it does over ssh. `stat -f "%Su" /dev/console` names the
+> account that can run the demo; `launchctl print gui/$(id -u)` answering *Domain does not support
+> specified action* is the same fact from the other side.
+
+### What the demo does not cover, and `sysl-lang/webview-demo` is the place to put it
+
+The demo predates `pump` and still calls `run`, so **nothing in this repository exercises the pumped
+loop with a real window**: that a click arrives within a tick, that `eval` reaches the page between
+turns, that a `bind_async` answer resolves a promise the page is already awaiting, and what an idle
+pumped process costs. Those want a second program beside the demo.
 
 ### AddressSanitizer
 
@@ -186,8 +255,10 @@ are evaluating this package, run that, because it is the part the green tick abo
 SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .
 ```
 
-Covers **the sysl half only** — webview arrives through `pkg_config`, so its objects are somebody
-else's build and no flag of ours instruments them.
+Covers **the sysl half and `pump.c`** — webview itself arrives through `pkg_config`, so its objects
+are somebody else's build and no flag of ours instruments them, but the shim is C in this tree and so
+is compiled with the flag like any vendored source. Clean at 0.3.0, with `__asan_memcpy` in
+`nm -u` to say the binary was really instrumented.
 
 > **Before sysl 0.0.104** a green ASan run over an unchanged tree proved nothing: `sysl test` cached
 > its artifact and the key did not include `SYSL_EXTRA_CFLAGS`, so the uninstrumented binary was
