@@ -1,3 +1,9 @@
+// glibc declares `RTLD_DEFAULT` in <dlfcn.h> only under `_GNU_SOURCE`, and the macro has to be set
+// before the first system header is read, so it goes above every include. Darwin needs nothing.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "pump.h"
 
 #include <stddef.h>
