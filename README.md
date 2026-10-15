@@ -4,6 +4,8 @@ A native window with the platform's own browser engine in it, for
 [sysl](https://github.com/sysl-lang/sysl) — bound to
 [webview](https://github.com/webview/webview).
 
+*An independent sysl package for webview. It is not affiliated with or endorsed by webview's authors or trademark holders.*
+
 No bundled engine and no Chromium: **WKWebView** on macOS, **WebKitGTK** on Linux, **WebView2** on
 Windows. A whole application is a window, some HTML, and a handful of functions the page can call.
 
