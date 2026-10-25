@@ -5,9 +5,8 @@ package {
   // `Webview` is a `Drop` type whose constructor answers `&T`, which 0.0.91's `DropReturnCheck` is
   // what keeps honest.
   //
-  // **This is a FLOOR and does not move with a release.** 0.3.0 added a `weak Webview` back-edge and
-  // a `Buf[&T]` of boxed closures, both of which 0.0.91 already had.
-  sysl = "0.0.91"
+  // **This is a FLOOR.** 0.6.0 is where `sysl.raw` and `.to_string()` exist.
+  sysl = "0.6.0"
 }
 
 // **`posix`, because a webview is a window.** It talks to a window server, spawns the platform's
@@ -36,9 +35,11 @@ requires {
   //     brew install sysl-lang/tap/webview
   //
   // The absolute install name is not a detail. webview's CMake gives the library a SOVERSION and so
-  // an `@rpath` install name, and `--link-path` emits `-L` and no `-rpath` — so a program built
-  // against a stock build links cleanly and then dies at startup with *"no LC_RPATH's found"*, which
-  // reads as a missing library sitting exactly where it was said to be.
+  // an `@rpath` install name, and a `pkg-config` probe leaves the run-time path to the `.pc` file —
+  // which upstream does not write — so a program built against a stock build links cleanly and then
+  // dies at startup with *"no LC_RPATH's found"*, which reads as a missing library sitting exactly
+  // where it was said to be. (A hand-written `--link-path` now emits its own rpath, so only the
+  // `pkg-config` route needs the formula's install name.)
   pkg_config {
     webview = "webview — `brew install sysl-lang/tap/webview`; upstream has no releases and no .pc, so the tap's formula is what provides both"
   }

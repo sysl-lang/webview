@@ -33,7 +33,7 @@ sh/sysl/webview/
     tests.sysl      7 tests — see Testing, which is the honest part of this file
     c/
         c.sysl      webview as C declares it, and the numbers its header computes
-package.hocon       who this package is, and what it needs of the machine
+sysl.hocon          who this package is, and what it needs of the machine
 ```
 
 **There is no shim** — no C at all in this repository.
@@ -67,8 +67,8 @@ Two reasons, and the second is the one that bites.
 hand, on every build, forever.
 
 **And a stock build cannot be run.** webview's CMake gives the library a `SOVERSION`, so the install
-name is `@rpath/libwebview.0.12.dylib`. sysl's `--link-path` emits `-L` and no `-rpath`, so a
-program links cleanly and then dies at startup:
+name is `@rpath/libwebview.0.12.dylib`. A `pkg-config` probe leaves the run-time path to the `.pc`
+file, and a stock build has none, so a program links cleanly and then dies at startup:
 
 ```
 dyld: Library not loaded: @rpath/libwebview.0.12.dylib
@@ -76,8 +76,8 @@ dyld: Library not loaded: @rpath/libwebview.0.12.dylib
 ```
 
 which reads as a missing library sitting exactly where it was said to be. The formula passes
-`-DCMAKE_INSTALL_NAME_DIR=#{opt_lib}` so the library says where it lives. (The underlying gap is
-filed against the compiler as card 0414.)
+`-DCMAKE_INSTALL_NAME_DIR=#{opt_lib}` so the library says where it lives. (A hand-written `--link-path`
+emits its own rpath since sysl 0.0.104, so only the `pkg-config` route depends on this.)
 
 ## The two facts the API is shaped by
 
