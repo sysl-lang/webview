@@ -1,12 +1,12 @@
 package {
   name    = "webview"
-  version = "0.3.4"
+  version = "0.3.5"
 
   // `Webview` is a `Drop` type whose constructor answers `&T`, which 0.0.91's `DropReturnCheck` is
   // what keeps honest.
   //
-  // **This is a FLOOR.** 0.6.0 is where `sysl.raw` and `.to_string()` exist.
-  sysl = "0.6.0"
+  // **This is a FLOOR.** 0.9.0 is where `Buf` lost `at` and `set` for indexing, which this reads.
+  sysl = "0.9.0"
 }
 
 // **`posix`, because a webview is a window.** It talks to a window server, spawns the platform's

@@ -310,12 +310,12 @@ struct Webview
     // the weak edge, and from nowhere else.
     private[webview] forget_work(*self, at: usize)
         for i in 0..<self.work.len()
-            val k = self.work.at(i)
+            val k = self.work[i]
             val p: *u8 = ptr_cast(&*k)
 
             if usize(p) == at
                 // The order does not matter, so the last one takes the gap.
-                self.work.set(i, self.work.at(self.work.len() - 1))
+                self.work[i] = self.work[self.work.len() - 1]
                 self.work.truncate(self.work.len() - 1)
 
                 return
@@ -339,9 +339,9 @@ struct Webview
 
     // The address C was handed for registration `i`, recovered exactly as `keep_bound` produced it —
     // so feeding it to `on_bound` is the page's call with the page left out.
-    private[webview] binding_arg(self, i: usize) -> *u8 = ptr_cast(&*self.bound.at(i))
+    private[webview] binding_arg(self, i: usize) -> *u8 = ptr_cast(&*self.bound[i])
 
-    private[webview] async_binding_arg(self, i: usize) -> *u8 = ptr_cast(&*self.bound_async.at(i))
+    private[webview] async_binding_arg(self, i: usize) -> *u8 = ptr_cast(&*self.bound_async[i])
 
     // The window's title.
     title(self, text: string) -> Result[unit, Error]

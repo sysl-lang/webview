@@ -50,7 +50,7 @@ brew install sysl-lang/tap/webview
 
 ```hocon
 dependencies {
-  webview { git = "github.com/sysl-lang/webview", version = "0.2.0" }
+  webview { git = "github.com/sysl-lang/webview", version = "0.3.5" }
 }
 ```
 
